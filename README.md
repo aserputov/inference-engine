@@ -280,8 +280,10 @@ Each `Request` has its own KV-cache and output queue, so tokens stream independe
 
 ## Benchmark Results
 
+### CPU Benchmarks (Apple M1)
+
 ```
-Prompt: "The meaning of life is" | 100 tokens | 3 runs average (Apple M1)
+Prompt: "The meaning of life is" | 100 tokens | 3 runs average
 
   No cache:   5.32s  |  18.8 tokens/sec
   KV-cache:   2.02s  |  49.4 tokens/sec
@@ -292,7 +294,30 @@ Prompt: "The meaning of life is" | 100 tokens | 3 runs average (Apple M1)
   Speedup:             1.16x faster with PagedAttention
 ```
 
-The KV-cache speedup grows with sequence length — longer generations benefit more from caching. PagedAttention advantage also grows with sequence length since it avoids the O(n²) copy overhead of `torch.cat`.
+### GPU Benchmarks (Tesla T4, Google Colab)
+
+![GPU Benchmark Results](assets/gpu_benchmark.png)
+
+```
+Attention Kernel (standard vs flash):
+  T=128:   standard 0.16ms  |  flash 0.30ms
+  T=256:   standard 0.32ms  |  flash 0.85ms
+  T=512:   standard 0.88ms  |  flash 2.16ms
+  T=1024:  standard 2.66ms  |  flash 7.78ms
+  Correctness: ✓ all sequence lengths match
+
+Memory savings:
+  T=256:   16x less memory (3.0 MB → 0.188 MB)
+  T=512:   64x less memory (12.0 MB → 0.188 MB)
+  T=1024: 256x less memory (48.0 MB → 0.188 MB)
+
+Generation (100 tokens):
+  GPU Flash:  1.94s  |  51.5 tokens/sec
+  CPU cache:  5.50s  |  18.2 tokens/sec
+  GPU speedup: 2.8x faster
+```
+
+Flash Attention is slower per-kernel at GPT-2's short context (max 1024) because the T×T matrix fits in GPU memory. The real advantage is **memory** — at longer contexts (4K, 8K, 128K) standard attention can't even fit the scores matrix, while Flash Attention tiles stay constant at 0.188 MB.
 
 ---
 
