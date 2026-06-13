@@ -158,6 +158,199 @@ class GPT2Cached(nn.Module):
 
 
 # ============================================================
+# PagedAttention KV-Cache
+# ============================================================
+
+class PagedKVCache:
+    def __init__(self, n_layers, n_heads, head_dim, page_size=16, max_pages=256):
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.page_size = page_size
+        self.max_pages = max_pages
+
+        self.k_pool = torch.zeros(max_pages, n_heads, page_size, head_dim)
+        self.v_pool = torch.zeros(max_pages, n_heads, page_size, head_dim)
+
+        self.free_pages = list(range(max_pages))
+        self.sequences = {}
+
+    def allocate_sequence(self, seq_id):
+        self.sequences[seq_id] = {
+            "page_tables": [[] for _ in range(self.n_layers)],
+            "length": 0,
+        }
+
+    def free_sequence(self, seq_id):
+        if seq_id not in self.sequences:
+            return
+        seq = self.sequences[seq_id]
+        for layer_pages in seq["page_tables"]:
+            self.free_pages.extend(layer_pages)
+        del self.sequences[seq_id]
+
+    def _get_page(self):
+        return self.free_pages.pop(0)
+
+    def append(self, seq_id, layer_idx, new_k, new_v):
+        seq = self.sequences[seq_id]
+        pages = seq["page_tables"][layer_idx]
+        pos_in_seq = seq["length"] if layer_idx == 0 else self.sequences[seq_id]["length"]
+        n_new = new_k.size(2)
+
+        for i in range(n_new):
+            slot = (pos_in_seq + i) % self.page_size
+            if slot == 0:
+                page_id = self._get_page()
+                pages.append(page_id)
+            page_id = pages[-1]
+            self.k_pool[page_id, :, slot, :] = new_k[0, :, i, :]
+            self.v_pool[page_id, :, slot, :] = new_v[0, :, i, :]
+
+        if layer_idx == self.n_layers - 1:
+            seq["length"] += n_new
+
+    def get_kv(self, seq_id, layer_idx):
+        seq = self.sequences[seq_id]
+        pages = seq["page_tables"][layer_idx]
+        length = seq["length"]
+
+        if not pages:
+            return None, None
+
+        k_parts = []
+        v_parts = []
+        remaining = length
+        for page_id in pages:
+            n = min(remaining, self.page_size)
+            k_parts.append(self.k_pool[page_id, :, :n, :])
+            v_parts.append(self.v_pool[page_id, :, :n, :])
+            remaining -= n
+
+        k = torch.cat(k_parts, dim=1).unsqueeze(0)
+        v = torch.cat(v_parts, dim=1).unsqueeze(0)
+        return k, v
+
+    def stats(self):
+        used = self.max_pages - len(self.free_pages)
+        return {
+            "total_pages": self.max_pages,
+            "used_pages": used,
+            "free_pages": len(self.free_pages),
+            "active_sequences": len(self.sequences),
+            "memory_used_mb": (used * self.n_heads * self.page_size * self.head_dim * 4 * 2) / 1024 / 1024,
+        }
+
+
+class PagedMultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.c_attn = nn.Linear(d_model, 3 * d_model)
+        self.c_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x, cached_k=None, cached_v=None):
+        B, T, C = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(C, dim=2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        new_k, new_v = k, v
+
+        if cached_k is not None:
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+
+        total_len = k.size(2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        mask = torch.tril(torch.ones(total_len, total_len, device=x.device))
+        mask = mask[-T:, :]
+        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+
+        weights = torch.softmax(scores, dim=-1)
+        out = torch.matmul(weights, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(out), new_k, new_v
+
+
+class PagedTransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(d_model)
+        self.attn = PagedMultiHeadAttention(d_model, n_heads)
+        self.ln_2 = nn.LayerNorm(d_model)
+        self.mlp = FeedForward(d_model)
+
+    def forward(self, x, cached_k=None, cached_v=None):
+        attn_out, new_k, new_v = self.attn(self.ln_1(x), cached_k, cached_v)
+        x = x + attn_out
+        x = x + self.mlp(self.ln_2(x))
+        return x, new_k, new_v
+
+
+class GPT2Paged(nn.Module):
+    def __init__(self, vocab_size=50257, d_model=768, n_heads=12, n_layers=12, max_len=1024):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.head_dim = d_model // n_heads
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.wpe = nn.Embedding(max_len, d_model)
+        self.blocks = nn.ModuleList([PagedTransformerBlock(d_model, n_heads) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model)
+
+    def forward(self, input_ids, paged_cache=None, seq_id=None, start_pos=0):
+        B, T = input_ids.size()
+        positions = torch.arange(start_pos, start_pos + T, device=input_ids.device).unsqueeze(0)
+        x = self.wte(input_ids) + self.wpe(positions)
+
+        for i, block in enumerate(self.blocks):
+            cached_k, cached_v = None, None
+            if paged_cache is not None and seq_id is not None:
+                cached_k, cached_v = paged_cache.get_kv(seq_id, i)
+
+            x, new_k, new_v = block(x, cached_k, cached_v)
+
+            if paged_cache is not None and seq_id is not None:
+                paged_cache.append(seq_id, i, new_k, new_v)
+
+        x = self.ln_f(x)
+        logits = x @ self.wte.weight.T
+        return logits
+
+
+def generate_paged(model, tokens, max_tokens=50, temperature=0.8, top_k=40, repetition_penalty=1.2):
+    paged_cache = PagedKVCache(
+        n_layers=model.n_layers, n_heads=model.n_heads,
+        head_dim=model.head_dim, page_size=16, max_pages=256,
+    )
+    seq_id = 0
+    paged_cache.allocate_sequence(seq_id)
+    model.eval()
+
+    with torch.no_grad():
+        input_ids = torch.tensor([tokens])
+        logits = model(input_ids, paged_cache=paged_cache, seq_id=seq_id)
+        next_token = apply_sampling(logits[0, -1, :], tokens, temperature, top_k, repetition_penalty)
+        tokens.append(next_token)
+        yield next_token
+
+        for _ in range(max_tokens - 1):
+            input_ids = torch.tensor([[tokens[-1]]])
+            logits = model(input_ids, paged_cache=paged_cache, seq_id=seq_id, start_pos=len(tokens) - 1)
+            next_token = apply_sampling(logits[0, -1, :], tokens, temperature, top_k, repetition_penalty)
+            tokens.append(next_token)
+            yield next_token
+
+    paged_cache.free_sequence(seq_id)
+
+
+# ============================================================
 # Weight Loading
 # ============================================================
 
@@ -480,6 +673,62 @@ def benchmark_batching(prompts=None, max_tokens=50):
     print("=" * 60)
 
 
+def benchmark_paged(prompt="The meaning of life is", max_tokens=100, runs=3):
+    enc = tiktoken.get_encoding("gpt2")
+    prompt_tokens = enc.encode(prompt)
+
+    print("\n" + "=" * 60)
+    print(f"PagedAttention Benchmark: \"{prompt}\"")
+    print(f"Prompt tokens: {len(prompt_tokens)} | Generate: {max_tokens} tokens | Runs: {runs}")
+    print("=" * 60)
+
+    # --- torch.cat cache ---
+    print("\nLoading model (torch.cat KV-cache)...")
+    model_cat = GPT2Cached()
+    load_openai_weights(model_cat)
+
+    times_cat = []
+    for r in range(runs):
+        tokens = list(prompt_tokens)
+        torch.manual_seed(42)
+        start = time.time()
+        for _ in generate_streaming(model_cat, tokens, max_tokens=max_tokens):
+            pass
+        times_cat.append(time.time() - start)
+        if r == 0:
+            text_cat = enc.decode(tokens)
+
+    avg_cat = sum(times_cat) / len(times_cat)
+    tps_cat = max_tokens / avg_cat
+    print(f"  torch.cat cache: {avg_cat:.2f}s  ({tps_cat:.1f} tokens/sec)")
+
+    # --- Paged cache ---
+    print("\nLoading model (PagedAttention)...")
+    model_paged = GPT2Paged()
+    load_openai_weights(model_paged)
+
+    times_paged = []
+    for r in range(runs):
+        tokens = list(prompt_tokens)
+        torch.manual_seed(42)
+        start = time.time()
+        for _ in generate_paged(model_paged, tokens, max_tokens=max_tokens):
+            pass
+        times_paged.append(time.time() - start)
+        if r == 0:
+            text_paged = enc.decode(tokens)
+
+    avg_paged = sum(times_paged) / len(times_paged)
+    tps_paged = max_tokens / avg_paged
+    print(f"  PagedAttention:  {avg_paged:.2f}s  ({tps_paged:.1f} tokens/sec)")
+
+    speedup = avg_cat / avg_paged
+    print(f"\n  Speedup: {speedup:.2f}x")
+    print(f"  Output match: {text_cat == text_paged}")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     benchmark(prompt="The meaning of life is", max_tokens=100, runs=3)
+    benchmark_paged()
     benchmark_batching()
