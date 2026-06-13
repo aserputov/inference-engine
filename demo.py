@@ -3,12 +3,13 @@ import tiktoken
 import time
 import json
 from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
-from engine import GPT2Cached, load_openai_weights, generate_streaming
+from engine import GPT2Cached, load_openai_weights, generate_streaming, ContinuousBatchingScheduler, Request
 
 model = GPT2Cached()
 load_openai_weights(model)
 model.eval()
 enc = tiktoken.get_encoding("gpt2")
+scheduler = ContinuousBatchingScheduler(model, max_batch_size=8)
 
 print("Ready!\n")
 
@@ -89,7 +90,7 @@ HTML = """
 <body>
     <div class="container">
         <h1>Inference Engine</h1>
-        <p class="subtitle">GPT-2 124M &middot; KV-Cache &middot; Streaming &middot; Token-by-token generation</p>
+        <p class="subtitle">GPT-2 124M &middot; KV-Cache &middot; Continuous Batching &middot; Streaming</p>
 
         <div class="label">Prompt</div>
         <textarea id="input" placeholder="Type a prompt...">The meaning of life is</textarea>
@@ -127,9 +128,10 @@ HTML = """
         </div>
 
         <div class="arch">
-            GPT-2 Small (124M) with KV-Cache optimization
+            GPT-2 Small (124M) with KV-Cache + Continuous Batching
             &middot; Prefill: process entire prompt in one pass, cache K/V
             &middot; Decode: generate one token at a time, reuse cached K/V
+            &middot; Continuous Batching: up to 8 requests processed simultaneously
             &middot; Streaming: tokens sent via SSE as they're generated
         </div>
     </div>
@@ -257,10 +259,15 @@ def stream_api():
         return jsonify({"error": "Empty prompt"})
 
     tokens = enc.encode(prompt)
+    req = Request(tokens, max_tokens=max_tokens, temperature=temperature,
+                  top_k=top_k, repetition_penalty=1.2)
+    scheduler.submit(req)
 
     def stream():
-        for token_id in generate_streaming(model, tokens, max_tokens=max_tokens,
-                                           temperature=temperature, top_k=top_k):
+        while True:
+            token_id = req.output_queue.get()
+            if token_id is None:
+                break
             word = enc.decode([token_id])
             yield f"data: {json.dumps({'token': word})}\n\n"
 

@@ -269,6 +269,90 @@ def generate_streaming(model, tokens, max_tokens=50, temperature=0.8, top_k=40, 
 
 
 # ============================================================
+# Continuous Batching Scheduler
+# ============================================================
+
+import threading
+import queue
+
+class Request:
+    def __init__(self, prompt_tokens, max_tokens=50, temperature=0.8, top_k=40, repetition_penalty=1.2):
+        self.prompt_tokens = prompt_tokens
+        self.tokens = list(prompt_tokens)
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
+        self.generated = 0
+        self.past_kv = None
+        self.started = False
+        self.finished = False
+        self.output_queue = queue.Queue()
+
+
+class ContinuousBatchingScheduler:
+    def __init__(self, model, max_batch_size=8):
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.waiting = queue.Queue()
+        self.active = []
+        self.lock = threading.Lock()
+        self.running = True
+
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def submit(self, req):
+        self.waiting.put(req)
+
+    def _loop(self):
+        while self.running:
+            with self.lock:
+                finished = [r for r in self.active if r.finished]
+                for r in finished:
+                    self.active.remove(r)
+
+                while len(self.active) < self.max_batch_size and not self.waiting.empty():
+                    req = self.waiting.get()
+                    self.active.append(req)
+
+            if not self.active:
+                time.sleep(0.01)
+                continue
+
+            with self.lock:
+                batch = list(self.active)
+
+            self._step(batch)
+
+    def _step(self, batch):
+        self.model.eval()
+        with torch.no_grad():
+            for req in batch:
+                if not req.started:
+                    input_ids = torch.tensor([req.tokens])
+                    logits, req.past_kv = self.model(input_ids)
+                    req.started = True
+                else:
+                    input_ids = torch.tensor([[req.tokens[-1]]])
+                    logits, req.past_kv = self.model(
+                        input_ids, past_kv=req.past_kv, start_pos=len(req.tokens) - 1
+                    )
+
+                next_token = apply_sampling(
+                    logits[0, -1, :], req.tokens,
+                    req.temperature, req.top_k, req.repetition_penalty
+                )
+                req.tokens.append(next_token)
+                req.generated += 1
+                req.output_queue.put(next_token)
+
+                if req.generated >= req.max_tokens:
+                    req.finished = True
+                    req.output_queue.put(None)
+
+
+# ============================================================
 # Benchmarks
 # ============================================================
 
@@ -340,5 +424,62 @@ def benchmark(prompt="The meaning of life is", max_tokens=100, runs=3):
     }
 
 
+def benchmark_batching(prompts=None, max_tokens=50):
+    if prompts is None:
+        prompts = [
+            "The meaning of life is",
+            "In a shocking finding, scientists discovered",
+            "Once upon a time, in a land far away,",
+            "The best programming language is",
+        ]
+
+    enc = tiktoken.get_encoding("gpt2")
+    print("\n" + "=" * 60)
+    print(f"Batching Benchmark: {len(prompts)} prompts, {max_tokens} tokens each")
+    print("=" * 60)
+
+    model = GPT2Cached()
+    load_openai_weights(model)
+
+    # --- Sequential (one by one) ---
+    torch.manual_seed(42)
+    start = time.time()
+    for prompt in prompts:
+        tokens = list(enc.encode(prompt))
+        for token_id in generate_streaming(model, tokens, max_tokens=max_tokens):
+            pass
+    sequential_time = time.time() - start
+    total_tokens = len(prompts) * max_tokens
+    seq_tps = total_tokens / sequential_time
+
+    print(f"\n  Sequential:         {sequential_time:.2f}s  ({seq_tps:.1f} tokens/sec)")
+
+    # --- Continuous batching ---
+    scheduler = ContinuousBatchingScheduler(model, max_batch_size=len(prompts))
+    torch.manual_seed(42)
+    start = time.time()
+    requests = []
+    for prompt in prompts:
+        tokens = list(enc.encode(prompt))
+        req = Request(tokens, max_tokens=max_tokens)
+        scheduler.submit(req)
+        requests.append(req)
+
+    for req in requests:
+        while True:
+            token = req.output_queue.get()
+            if token is None:
+                break
+    batch_time = time.time() - start
+    batch_tps = total_tokens / batch_time
+    scheduler.running = False
+
+    print(f"  Continuous batch:   {batch_time:.2f}s  ({batch_tps:.1f} tokens/sec)")
+    speedup = sequential_time / batch_time
+    print(f"  Speedup:            {speedup:.2f}x faster with batching")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     benchmark(prompt="The meaning of life is", max_tokens=100, runs=3)
+    benchmark_batching()
