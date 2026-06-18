@@ -849,6 +849,34 @@ class PrefixCache:
         }
 
 
+def _prefill_tokens(model, prefix_cache, seq_id, token_ids, start_pos):
+    input_ids = torch.tensor([token_ids])
+    positions = torch.arange(start_pos, start_pos + len(token_ids)).unsqueeze(0)
+    x = model.wte(input_ids) + model.wpe(positions)
+
+    for i, block in enumerate(model.blocks):
+        cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
+        x, new_k, new_v = block(x, cached_k, cached_v)
+        prefix_cache.append(seq_id, i, new_k, new_v)
+
+    x = model.ln_f(x)
+    return x @ model.wte.weight.T
+
+
+def _decode_one(model, prefix_cache, seq_id, token_id, pos):
+    input_ids = torch.tensor([[token_id]])
+    positions = torch.tensor([[pos]])
+    x = model.wte(input_ids) + model.wpe(positions)
+
+    for i, block in enumerate(model.blocks):
+        cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
+        x, new_k, new_v = block(x, cached_k, cached_v)
+        prefix_cache.append(seq_id, i, new_k, new_v)
+
+    x = model.ln_f(x)
+    return x @ model.wte.weight.T
+
+
 def generate_prefix_cached(model, tokens, prefix_cache, prefix_tokens=None,
                            max_tokens=50, temperature=0.8, top_k=40, repetition_penalty=1.2):
     seq_id = prefix_cache.next_seq_id
@@ -859,62 +887,31 @@ def generate_prefix_cached(model, tokens, prefix_cache, prefix_tokens=None,
     if prefix_tokens is None:
         prefix_tokens = tokens
 
+    n_prefix = len(prefix_tokens)
     hit_len, entry = prefix_cache.lookup(prefix_tokens)
 
     with torch.no_grad():
         if hit_len > 0 and entry is not None:
             prefix_cache.clone_pages_from_entry(seq_id, entry, hit_len)
-            remaining_tokens = tokens[hit_len:]
-            start_pos = hit_len
-
-            if remaining_tokens:
-                input_ids = torch.tensor([remaining_tokens])
-                positions = torch.arange(start_pos, start_pos + len(remaining_tokens)).unsqueeze(0)
-                x = model.wte(input_ids) + model.wpe(positions)
-
-                for i, block in enumerate(model.blocks):
-                    cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
-                    x, new_k, new_v = block(x, cached_k, cached_v)
-                    prefix_cache.append(seq_id, i, new_k, new_v)
-
-                x = model.ln_f(x)
-                logits = x @ model.wte.weight.T
+            remaining = tokens[hit_len:]
+            if remaining:
+                logits = _prefill_tokens(model, prefix_cache, seq_id, remaining, hit_len)
             else:
-                cached_k, _ = prefix_cache.get_kv(seq_id, 0)
-                last_pos = prefix_cache.sequences[seq_id]["length"] - 1
-                input_ids = torch.tensor([[tokens[-1]]])
-                positions = torch.tensor([[last_pos]])
-                x = model.wte(input_ids) + model.wpe(positions)
-
-                for i, block in enumerate(model.blocks):
-                    cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
-                    x, new_k, new_v = block(x, cached_k, cached_v)
-
-                x = model.ln_f(x)
-                logits = x @ model.wte.weight.T
+                logits = _decode_one(model, prefix_cache, seq_id, tokens[-1], hit_len - 1)
         else:
-            input_ids = torch.tensor([tokens])
-            logits = model(input_ids, paged_cache=prefix_cache, seq_id=seq_id)
+            logits = _prefill_tokens(model, prefix_cache, seq_id, prefix_tokens, 0)
             prefix_cache.save_prefix(prefix_tokens, seq_id)
+
+            remaining = tokens[n_prefix:]
+            if remaining:
+                logits = _prefill_tokens(model, prefix_cache, seq_id, remaining, n_prefix)
 
         next_token = apply_sampling(logits[0, -1, :], tokens, temperature, top_k, repetition_penalty)
         tokens.append(next_token)
         yield next_token
 
         for _ in range(max_tokens - 1):
-            input_ids = torch.tensor([[tokens[-1]]])
-            start_pos = len(tokens) - 1
-            positions = torch.tensor([[start_pos]])
-            x = model.wte(input_ids) + model.wpe(positions)
-
-            for i, block in enumerate(model.blocks):
-                cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
-                x, new_k, new_v = block(x, cached_k, cached_v)
-                prefix_cache.append(seq_id, i, new_k, new_v)
-
-            x = model.ln_f(x)
-            logits = x @ model.wte.weight.T
-
+            logits = _decode_one(model, prefix_cache, seq_id, tokens[-1], len(tokens) - 1)
             next_token = apply_sampling(logits[0, -1, :], tokens, temperature, top_k, repetition_penalty)
             tokens.append(next_token)
             yield next_token
@@ -984,8 +981,6 @@ def benchmark_prefix_cache(max_tokens=50, runs=5):
             max_tokens=max_tokens,
         ):
             pass
-        if i == 0:
-            pcache.save_prefix(system_tokens, 0)
     time_prefix = time.time() - start
     tps_prefix = total_tokens / time_prefix
     print(f"    Time: {time_prefix:.2f}s  ({tps_prefix:.1f} tokens/sec)")
