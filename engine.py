@@ -998,8 +998,176 @@ def benchmark_prefix_cache(max_tokens=50, runs=5):
     print("=" * 60)
 
 
+# ============================================================
+# Speculative Decoding
+# ============================================================
+
+class DraftModel(nn.Module):
+    def __init__(self, full_model, n_draft_layers=4):
+        super().__init__()
+        self.wte = full_model.wte
+        self.wpe = full_model.wpe
+        self.blocks = nn.ModuleList(list(full_model.blocks)[:n_draft_layers])
+        self.ln_f = full_model.ln_f
+        self.n_draft_layers = n_draft_layers
+
+    def forward(self, input_ids, past_kv=None, start_pos=0):
+        B, T = input_ids.size()
+        positions = torch.arange(start_pos, start_pos + T, device=input_ids.device).unsqueeze(0)
+        x = self.wte(input_ids) + self.wpe(positions)
+
+        new_kv = []
+        for i, block in enumerate(self.blocks):
+            layer_cache = past_kv[i] if past_kv is not None else None
+            x, cache = block(x, layer_cache)
+            new_kv.append(cache)
+
+        x = self.ln_f(x)
+        logits = x @ self.wte.weight.T
+        return logits, new_kv
+
+
+def speculative_decode(target_model, draft_model, tokens, max_tokens=50,
+                       K=5, temperature=0.8, top_k=40, repetition_penalty=1.2):
+    target_model.eval()
+    draft_model.eval()
+    generated = 0
+    total_draft = 0
+    total_accepted = 0
+
+    with torch.no_grad():
+        input_ids = torch.tensor([tokens])
+        _, target_kv = target_model(input_ids)
+        _, draft_kv = draft_model(input_ids)
+
+        while generated < max_tokens:
+            draft_tokens = []
+            draft_probs = []
+            current_draft_kv = [(k.clone(), v.clone()) for k, v in draft_kv]
+            last_tok = tokens[-1]
+
+            for _ in range(min(K, max_tokens - generated)):
+                inp = torch.tensor([[last_tok]])
+                pos = len(tokens) + len(draft_tokens)
+                logits_d, current_draft_kv = draft_model(inp, past_kv=current_draft_kv, start_pos=pos)
+                probs_d = torch.softmax(logits_d[0, -1, :] / temperature, dim=-1)
+                tok = torch.argmax(probs_d).item()
+                draft_tokens.append(tok)
+                draft_probs.append(probs_d)
+                last_tok = tok
+
+            total_draft += len(draft_tokens)
+
+            verify_input = torch.tensor([[tokens[-1]] + draft_tokens])
+            logits_t, new_target_kv = target_model(
+                verify_input, past_kv=target_kv, start_pos=len(tokens)
+            )
+
+            n_accepted = 0
+            for j in range(len(draft_tokens)):
+                target_tok = torch.argmax(logits_t[0, j, :]).item()
+                if target_tok == draft_tokens[j]:
+                    tokens.append(draft_tokens[j])
+                    generated += 1
+                    n_accepted += 1
+                    if generated >= max_tokens:
+                        break
+                else:
+                    tokens.append(target_tok)
+                    generated += 1
+                    break
+
+            total_accepted += n_accepted
+
+            if n_accepted == len(draft_tokens) and generated < max_tokens:
+                bonus = torch.argmax(logits_t[0, -1, :]).item()
+                tokens.append(bonus)
+                generated += 1
+
+            if generated >= max_tokens:
+                break
+
+            keep = len(tokens)
+            target_kv = [(k[:, :, :keep, :], v[:, :, :keep, :]) for k, v in new_target_kv]
+
+            _, draft_kv = draft_model(torch.tensor([tokens]))
+
+    accept_rate = total_accepted / total_draft if total_draft > 0 else 0
+    return tokens, {"accept_rate": accept_rate, "draft_tokens": total_draft, "accepted": total_accepted}
+
+
+def generate_standard(model, tokens, max_tokens=50):
+    model.eval()
+    with torch.no_grad():
+        input_ids = torch.tensor([tokens])
+        logits, past_kv = model(input_ids)
+        next_token = torch.argmax(logits[0, -1, :]).item()
+        tokens.append(next_token)
+
+        for _ in range(max_tokens - 1):
+            input_ids = torch.tensor([[tokens[-1]]])
+            logits, past_kv = model(input_ids, past_kv=past_kv, start_pos=len(tokens) - 1)
+            next_token = torch.argmax(logits[0, -1, :]).item()
+            tokens.append(next_token)
+    return tokens
+
+
+def benchmark_speculative(prompt="The meaning of life is", max_tokens=50, K=5, runs=3):
+    enc = tiktoken.get_encoding("gpt2")
+    prompt_tokens = enc.encode(prompt)
+
+    print("\n" + "=" * 60)
+    print(f"Speculative Decoding Benchmark")
+    print(f"Prompt: \"{prompt}\"")
+    n_draft = 10
+    print(f"Draft: {n_draft} layers | Target: 12 layers | K={K} candidates")
+    print(f"Generate: {max_tokens} tokens | Runs: {runs}")
+    print("=" * 60)
+
+    target = GPT2Cached()
+    load_openai_weights(target)
+    draft = DraftModel(target, n_draft_layers=n_draft)
+
+    # --- Standard (target only) ---
+    print("\n  Standard decoding (12 layers):")
+    times_std = []
+    for r in range(runs):
+        tokens = list(prompt_tokens)
+        torch.manual_seed(42)
+        start = time.time()
+        result_std = generate_standard(target, tokens, max_tokens=max_tokens)
+        times_std.append(time.time() - start)
+    avg_std = sum(times_std) / len(times_std)
+    tps_std = max_tokens / avg_std
+    print(f"    Time: {avg_std:.2f}s  ({tps_std:.1f} tokens/sec)")
+    print(f"    Output: {enc.decode(result_std)[:80]}...")
+
+    # --- Speculative ---
+    print(f"\n  Speculative decoding (4-layer draft, K={K}):")
+    times_spec = []
+    all_stats = []
+    for r in range(runs):
+        tokens = list(prompt_tokens)
+        torch.manual_seed(42)
+        start = time.time()
+        result_spec, stats = speculative_decode(target, draft, tokens, max_tokens=max_tokens, K=K)
+        times_spec.append(time.time() - start)
+        all_stats.append(stats)
+    avg_spec = sum(times_spec) / len(times_spec)
+    tps_spec = max_tokens / avg_spec
+    avg_accept = sum(s["accept_rate"] for s in all_stats) / len(all_stats)
+    print(f"    Time: {avg_spec:.2f}s  ({tps_spec:.1f} tokens/sec)")
+    print(f"    Accept rate: {avg_accept:.1%}")
+    print(f"    Output: {enc.decode(result_spec)[:80]}...")
+
+    speedup = avg_std / avg_spec
+    print(f"\n  Speedup: {speedup:.2f}x")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     benchmark(prompt="The meaning of life is", max_tokens=100, runs=3)
     benchmark_paged()
     benchmark_batching()
     benchmark_prefix_cache()
+    benchmark_speculative()
