@@ -728,7 +728,283 @@ def benchmark_paged(prompt="The meaning of life is", max_tokens=100, runs=3):
     print("=" * 60)
 
 
+# ============================================================
+# Prefix Caching
+# ============================================================
+
+class PrefixCache:
+    def __init__(self, n_layers, n_heads, head_dim, page_size=16, max_pages=512):
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.page_size = page_size
+        self.max_pages = max_pages
+
+        self.k_pool = torch.zeros(max_pages, n_heads, page_size, head_dim)
+        self.v_pool = torch.zeros(max_pages, n_heads, page_size, head_dim)
+        self.free_pages = list(range(max_pages))
+
+        self.cache = {}
+        self.next_seq_id = 0
+        self.sequences = {}
+
+    def _alloc_page(self):
+        return self.free_pages.pop(0)
+
+    def lookup(self, tokens):
+        key = tuple(tokens)
+        best_len = 0
+        best_entry = None
+        for cached_key, entry in self.cache.items():
+            prefix_len = min(len(cached_key), len(key))
+            match = 0
+            for i in range(prefix_len):
+                if cached_key[i] != key[i]:
+                    break
+                match += 1
+            if match > best_len:
+                best_len = match
+                best_entry = entry
+        return best_len, best_entry
+
+    def allocate_sequence(self, seq_id):
+        self.sequences[seq_id] = {
+            "page_tables": [[] for _ in range(self.n_layers)],
+            "length": 0,
+        }
+
+    def free_sequence(self, seq_id):
+        if seq_id in self.sequences:
+            del self.sequences[seq_id]
+
+    def clone_pages_from_entry(self, seq_id, entry, n_tokens):
+        seq = self.sequences[seq_id]
+        pages_needed = (n_tokens + self.page_size - 1) // self.page_size
+
+        for layer_idx in range(self.n_layers):
+            src_pages = entry["page_tables"][layer_idx][:pages_needed]
+            new_pages = []
+            for src_page in src_pages:
+                dst_page = self._alloc_page()
+                self.k_pool[dst_page] = self.k_pool[src_page].clone()
+                self.v_pool[dst_page] = self.v_pool[src_page].clone()
+                new_pages.append(dst_page)
+            seq["page_tables"][layer_idx] = new_pages
+        seq["length"] = n_tokens
+
+    def append(self, seq_id, layer_idx, new_k, new_v):
+        seq = self.sequences[seq_id]
+        pages = seq["page_tables"][layer_idx]
+        pos_in_seq = seq["length"]
+        n_new = new_k.size(2)
+
+        for i in range(n_new):
+            slot = (pos_in_seq + i) % self.page_size
+            if slot == 0:
+                page_id = self._alloc_page()
+                pages.append(page_id)
+            page_id = pages[-1]
+            self.k_pool[page_id, :, slot, :] = new_k[0, :, i, :]
+            self.v_pool[page_id, :, slot, :] = new_v[0, :, i, :]
+
+        if layer_idx == self.n_layers - 1:
+            seq["length"] += n_new
+
+    def get_kv(self, seq_id, layer_idx):
+        seq = self.sequences[seq_id]
+        pages = seq["page_tables"][layer_idx]
+        length = seq["length"]
+
+        if not pages:
+            return None, None
+
+        k_parts, v_parts = [], []
+        remaining = length
+        for page_id in pages:
+            n = min(remaining, self.page_size)
+            k_parts.append(self.k_pool[page_id, :, :n, :])
+            v_parts.append(self.v_pool[page_id, :, :n, :])
+            remaining -= n
+
+        k = torch.cat(k_parts, dim=1).unsqueeze(0)
+        v = torch.cat(v_parts, dim=1).unsqueeze(0)
+        return k, v
+
+    def save_prefix(self, tokens, seq_id):
+        seq = self.sequences[seq_id]
+        key = tuple(tokens)
+        self.cache[key] = {
+            "page_tables": [list(layer_pages) for layer_pages in seq["page_tables"]],
+            "length": seq["length"],
+        }
+
+    def stats(self):
+        used = self.max_pages - len(self.free_pages)
+        return {
+            "total_pages": self.max_pages,
+            "used_pages": used,
+            "free_pages": len(self.free_pages),
+            "cached_prefixes": len(self.cache),
+            "active_sequences": len(self.sequences),
+        }
+
+
+def generate_prefix_cached(model, tokens, prefix_cache, prefix_tokens=None,
+                           max_tokens=50, temperature=0.8, top_k=40, repetition_penalty=1.2):
+    seq_id = prefix_cache.next_seq_id
+    prefix_cache.next_seq_id += 1
+    prefix_cache.allocate_sequence(seq_id)
+    model.eval()
+
+    if prefix_tokens is None:
+        prefix_tokens = tokens
+
+    hit_len, entry = prefix_cache.lookup(prefix_tokens)
+
+    with torch.no_grad():
+        if hit_len > 0 and entry is not None:
+            prefix_cache.clone_pages_from_entry(seq_id, entry, hit_len)
+            remaining_tokens = tokens[hit_len:]
+            start_pos = hit_len
+
+            if remaining_tokens:
+                input_ids = torch.tensor([remaining_tokens])
+                positions = torch.arange(start_pos, start_pos + len(remaining_tokens)).unsqueeze(0)
+                x = model.wte(input_ids) + model.wpe(positions)
+
+                for i, block in enumerate(model.blocks):
+                    cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
+                    x, new_k, new_v = block(x, cached_k, cached_v)
+                    prefix_cache.append(seq_id, i, new_k, new_v)
+
+                x = model.ln_f(x)
+                logits = x @ model.wte.weight.T
+            else:
+                cached_k, _ = prefix_cache.get_kv(seq_id, 0)
+                last_pos = prefix_cache.sequences[seq_id]["length"] - 1
+                input_ids = torch.tensor([[tokens[-1]]])
+                positions = torch.tensor([[last_pos]])
+                x = model.wte(input_ids) + model.wpe(positions)
+
+                for i, block in enumerate(model.blocks):
+                    cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
+                    x, new_k, new_v = block(x, cached_k, cached_v)
+
+                x = model.ln_f(x)
+                logits = x @ model.wte.weight.T
+        else:
+            input_ids = torch.tensor([tokens])
+            logits = model(input_ids, paged_cache=prefix_cache, seq_id=seq_id)
+            prefix_cache.save_prefix(prefix_tokens, seq_id)
+
+        next_token = apply_sampling(logits[0, -1, :], tokens, temperature, top_k, repetition_penalty)
+        tokens.append(next_token)
+        yield next_token
+
+        for _ in range(max_tokens - 1):
+            input_ids = torch.tensor([[tokens[-1]]])
+            start_pos = len(tokens) - 1
+            positions = torch.tensor([[start_pos]])
+            x = model.wte(input_ids) + model.wpe(positions)
+
+            for i, block in enumerate(model.blocks):
+                cached_k, cached_v = prefix_cache.get_kv(seq_id, i)
+                x, new_k, new_v = block(x, cached_k, cached_v)
+                prefix_cache.append(seq_id, i, new_k, new_v)
+
+            x = model.ln_f(x)
+            logits = x @ model.wte.weight.T
+
+            next_token = apply_sampling(logits[0, -1, :], tokens, temperature, top_k, repetition_penalty)
+            tokens.append(next_token)
+            yield next_token
+
+    prefix_cache.free_sequence(seq_id)
+
+
+def benchmark_prefix_cache(max_tokens=50, runs=5):
+    enc = tiktoken.get_encoding("gpt2")
+
+    system_prompt = "You are a helpful assistant that answers questions concisely and accurately."
+    questions = [
+        "What is attention in transformers?",
+        "Explain gradient descent briefly.",
+        "What is a GPU kernel?",
+        "How does backpropagation work?",
+        "What is the softmax function?",
+    ]
+
+    system_tokens = enc.encode(system_prompt)
+
+    print("\n" + "=" * 60)
+    print("Prefix Caching Benchmark")
+    print(f"System prompt: {len(system_tokens)} tokens")
+    print(f"Questions: {len(questions)} | Generate: {max_tokens} tokens each")
+    print("=" * 60)
+
+    model = GPT2Paged()
+    load_openai_weights(model)
+
+    # --- Without prefix caching (fresh PagedKVCache each time) ---
+    print("\n  Without prefix caching:")
+    torch.manual_seed(42)
+    start = time.time()
+    for q in questions:
+        full_tokens = system_tokens + enc.encode(" " + q)
+        paged = PagedKVCache(
+            n_layers=model.n_layers, n_heads=model.n_heads,
+            head_dim=model.head_dim, page_size=16, max_pages=256,
+        )
+        seq_id = 0
+        paged.allocate_sequence(seq_id)
+        tokens = list(full_tokens)
+        for _ in generate_paged(model, tokens, max_tokens=max_tokens):
+            pass
+    time_no_prefix = time.time() - start
+    total_tokens = len(questions) * max_tokens
+    tps_no_prefix = total_tokens / time_no_prefix
+    print(f"    Time: {time_no_prefix:.2f}s  ({tps_no_prefix:.1f} tokens/sec)")
+    print(f"    Prefill per request: {len(system_tokens)} system + question tokens")
+
+    # --- With prefix caching ---
+    print("\n  With prefix caching:")
+    pcache = PrefixCache(
+        n_layers=model.n_layers, n_heads=model.n_heads,
+        head_dim=model.head_dim, page_size=16, max_pages=512,
+    )
+
+    torch.manual_seed(42)
+    start = time.time()
+    for i, q in enumerate(questions):
+        full_tokens = system_tokens + enc.encode(" " + q)
+        tokens = list(full_tokens)
+        for _ in generate_prefix_cached(
+            model, tokens, pcache,
+            prefix_tokens=system_tokens,
+            max_tokens=max_tokens,
+        ):
+            pass
+        if i == 0:
+            pcache.save_prefix(system_tokens, 0)
+    time_prefix = time.time() - start
+    tps_prefix = total_tokens / time_prefix
+    print(f"    Time: {time_prefix:.2f}s  ({tps_prefix:.1f} tokens/sec)")
+    hit_len, _ = pcache.lookup(system_tokens)
+    print(f"    Cache hit: {hit_len} tokens reused per request (after first)")
+    print(f"    Prefill per request: only question tokens (after first)")
+
+    stats = pcache.stats()
+    print(f"    Cached prefixes: {stats['cached_prefixes']}")
+
+    speedup = time_no_prefix / time_prefix
+    saved_prefill = (len(questions) - 1) * len(system_tokens)
+    print(f"\n  Speedup: {speedup:.2f}x")
+    print(f"  Prefill tokens saved: {saved_prefill} (system prompt computed once)")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     benchmark(prompt="The meaning of life is", max_tokens=100, runs=3)
     benchmark_paged()
     benchmark_batching()
+    benchmark_prefix_cache()
