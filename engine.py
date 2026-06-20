@@ -999,6 +999,204 @@ def benchmark_prefix_cache(max_tokens=50, runs=5):
 
 
 # ============================================================
+# LoRA (Low-Rank Adaptation)
+# ============================================================
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_linear, rank=4, alpha=1.0, target_slices=None):
+        super().__init__()
+        self.original = original_linear
+        self.rank = rank
+        self.alpha = alpha
+        in_features = original_linear.in_features
+        self.target_slices = target_slices
+
+        if target_slices is not None:
+            self.lora_pairs = nn.ModuleList()
+            for start, end in target_slices:
+                out_dim = end - start
+                A = nn.Linear(in_features, rank, bias=False)
+                B = nn.Linear(rank, out_dim, bias=False)
+                nn.init.kaiming_uniform_(A.weight, a=math.sqrt(5))
+                nn.init.zeros_(B.weight)
+                self.lora_pairs.append(nn.ModuleList([A, B]))
+        else:
+            out_features = original_linear.out_features
+            self.A = nn.Linear(in_features, rank, bias=False)
+            self.B = nn.Linear(rank, out_features, bias=False)
+            nn.init.kaiming_uniform_(self.A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.B.weight)
+
+    def forward(self, x):
+        base_out = self.original(x)
+
+        if self.target_slices is not None:
+            for (start, end), pair in zip(self.target_slices, self.lora_pairs):
+                A, B = pair
+                lora_out = B(A(x)) * self.alpha
+                base_out[:, :, start:end] = base_out[:, :, start:end] + lora_out
+        else:
+            lora_out = self.B(self.A(x)) * self.alpha
+            base_out = base_out + lora_out
+
+        return base_out
+
+
+def apply_lora(model, rank=4, alpha=1.0):
+    d_model = model.blocks[0].attn.c_attn.in_features
+    lora_params = []
+
+    for block in model.blocks:
+        q_slice = (0, d_model)
+        v_slice = (2 * d_model, 3 * d_model)
+
+        lora_attn = LoRALinear(
+            block.attn.c_attn,
+            rank=rank,
+            alpha=alpha,
+            target_slices=[q_slice, v_slice],
+        )
+        block.attn.c_attn = lora_attn
+        lora_params.extend(lora_attn.lora_pairs.parameters())
+
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in lora_params:
+        param.requires_grad = True
+
+    return lora_params
+
+
+def lora_state_dict(model):
+    return {k: v for k, v in model.state_dict().items() if "lora" in k}
+
+
+def load_lora_weights(model, state_dict):
+    model.load_state_dict(state_dict, strict=False)
+
+
+def finetune_lora(model, train_tokens, epochs=3, lr=1e-3, seq_len=64):
+    lora_params = apply_lora(model, rank=4, alpha=1.0)
+    optimizer = torch.optim.AdamW(lora_params, lr=lr)
+
+    total_base = sum(p.numel() for p in model.parameters())
+    total_lora = sum(p.numel() for p in lora_params)
+    print(f"  Base params: {total_base:,} (frozen)")
+    print(f"  LoRA params: {total_lora:,} (trainable)")
+    print(f"  Ratio: {total_lora/total_base:.4%}")
+
+    n_seqs = max(1, (len(train_tokens) - 1) // seq_len)
+
+    for epoch in range(epochs):
+        total_loss = 0
+        n_batches = 0
+
+        for i in range(n_seqs):
+            start = i * seq_len
+            end = min(start + seq_len + 1, len(train_tokens))
+            if end - start < 2:
+                continue
+
+            chunk = train_tokens[start:end]
+            input_ids = torch.tensor([chunk[:-1]])
+            targets = torch.tensor([chunk[1:]])
+
+            if hasattr(model, 'd_model'):
+                logits, _ = model(input_ids)
+            else:
+                logits = model(input_ids)
+
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        print(f"  Epoch {epoch+1}/{epochs}  loss: {avg_loss:.4f}")
+
+    return lora_params
+
+
+def benchmark_lora(prompt="Shakespeare said", max_tokens=50):
+    enc = tiktoken.get_encoding("gpt2")
+
+    print("\n" + "=" * 60)
+    print("LoRA Fine-tuning Benchmark")
+    print("=" * 60)
+
+    model = GPT2Cached()
+    load_openai_weights(model)
+
+    print(f"\n  --- Before fine-tuning ---")
+    tokens = enc.encode(prompt)
+    model.eval()
+    with torch.no_grad():
+        result = list(tokens)
+        input_ids = torch.tensor([result])
+        logits, past_kv = model(input_ids)
+        next_token = torch.argmax(logits[0, -1, :]).item()
+        result.append(next_token)
+        for _ in range(max_tokens - 1):
+            input_ids = torch.tensor([[result[-1]]])
+            logits, past_kv = model(input_ids, past_kv=past_kv, start_pos=len(result) - 1)
+            next_token = torch.argmax(logits[0, -1, :]).item()
+            result.append(next_token)
+    print(f"  Output: {enc.decode(result)[:120]}")
+
+    train_text = (
+        "To be, or not to be, that is the question. "
+        "Whether 'tis nobler in the mind to suffer "
+        "the slings and arrows of outrageous fortune, "
+        "or to take arms against a sea of troubles. "
+        "All the world's a stage, and all the men and women merely players. "
+        "They have their exits and their entrances. "
+        "The lady doth protest too much, methinks. "
+        "Though this be madness, yet there is method in it. "
+        "Brevity is the soul of wit. "
+        "There is nothing either good or bad, but thinking makes it so. "
+    ) * 10
+
+    train_tokens = enc.encode(train_text)
+    print(f"\n  --- Fine-tuning on Shakespeare ({len(train_tokens)} tokens) ---")
+
+    start = time.time()
+    lora_params = finetune_lora(model, train_tokens, epochs=5, lr=1e-3, seq_len=64)
+    train_time = time.time() - start
+    print(f"  Training time: {train_time:.1f}s")
+
+    adapter = lora_state_dict(model)
+    adapter_size = sum(v.numel() * 4 for v in adapter.values())
+    print(f"  Adapter size: {adapter_size / 1024:.1f} KB ({len(adapter)} tensors)")
+
+    print(f"\n  --- After fine-tuning ---")
+    model.eval()
+    with torch.no_grad():
+        result = list(enc.encode(prompt))
+        input_ids = torch.tensor([result])
+        logits, past_kv = model(input_ids)
+        next_token = torch.argmax(logits[0, -1, :]).item()
+        result.append(next_token)
+        for _ in range(max_tokens - 1):
+            input_ids = torch.tensor([[result[-1]]])
+            logits, past_kv = model(input_ids, past_kv=past_kv, start_pos=len(result) - 1)
+            next_token = torch.argmax(logits[0, -1, :]).item()
+            result.append(next_token)
+    print(f"  Output: {enc.decode(result)[:120]}")
+
+    torch.save(adapter, "lora_shakespeare.pt")
+    print(f"\n  Adapter saved: lora_shakespeare.pt")
+
+    print("=" * 60)
+
+
+# ============================================================
 # Speculative Decoding
 # ============================================================
 
@@ -1171,3 +1369,4 @@ if __name__ == "__main__":
     benchmark_batching()
     benchmark_prefix_cache()
     benchmark_speculative()
+    benchmark_lora()
